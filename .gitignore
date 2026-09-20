@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+vendor/
+
+# 설정과 자격은 ~/.querypie/ 에 두지만, 실수로 작업 디렉터리에 놓였을 때를 막는다
+querypie-config.json
+querypie-cookie.json
+querypie-login.json
+querypie-conn-map.json
+querypie-connection.txt
+querypie-open*.b64
+*.har
