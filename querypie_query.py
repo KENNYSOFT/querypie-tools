@@ -59,6 +59,12 @@ QueryPie 가 쿠키 인증이므로 브라우저 세션 쿠키를 재사용한�
     TEXT/JSON 컬럼도 그대로 나온다 (셀마다 왕복이 한 번 더 드니 --lob-cells 로 상한을 둔다).
   - 백업처럼 값이 잘리면 안 되는 경우에는 `--tsv` 를 함께 쓸 것 — 표 모드는 컬럼폭
     상한(--max-col-width, 기본 80)에서 말줄임한다.
+
+행 수 다루기:
+  - `--rows` 하나만 주면 된다. 서버가 결과셋을 만들 때 자르는 값(execute 의 limitCount)도
+    같은 값으로 맞추므로, 큰 수를 줘도 중간에서 잘리지 않는다.
+  - 결과가 그 상한을 **정확히** 채우면 뒤가 더 있는지 알 수 없다 — 서버는 잘렸다고 알려주지
+    않으므로 도구가 경고를 남긴다. 그때는 `--rows` 를 늘리거나 `--start-row` 로 이어 받는다.
 """
 import argparse
 import base64
@@ -351,6 +357,8 @@ def render_data_table(frames, max_col_width=80, tsv=False, expand=None):
     백업 용도(긴 JSON 컬럼 등)에 쓰고, 리다이렉트로 파일에 그대로 담을 수 있다.
 
     expand 는 파싱된 행 목록을 받아 돌려주는 후처리다 (LOB 핸들 복원에 쓴다).
+
+    출력한 행 수를 돌려준다 — 호출자가 상한에 닿았는지(= 잘렸을 수 있는지) 판정한다.
     """
     cols, rows_blob = [], None
     for d in frames:
@@ -366,7 +374,7 @@ def render_data_table(frames, max_col_width=80, tsv=False, expand=None):
                 rows_blob = val
     if not cols:
         info("  (컬럼 없음)")
-        return
+        return 0
 
     # 행 먼저 파싱 (컬럼폭 계산에 값 길이가 필요하므로)
     parsed = []
@@ -401,10 +409,10 @@ def render_data_table(frames, max_col_width=80, tsv=False, expand=None):
         print("\t".join(cols))
         if rows_blob is None:
             info("  (행 데이터 없음)")
-            return
+            return 0
         for out in parsed:
             print("\t".join(tsv_cell(v) for v in out))
-        return
+        return len(parsed)
 
     # 표는 한 행이 한 줄이라 값 안의 개행/탭을 표기로 바꾼다 (복원한 LOB 은 여러 줄이다)
     parsed = [[v.replace("\t", " ").replace("\r", "").replace("\n", "\\n") for v in row]
@@ -425,9 +433,10 @@ def render_data_table(frames, max_col_width=80, tsv=False, expand=None):
     print("  " + "-+-".join("-" * w for w in widths))
     if rows_blob is None:
         info("  (행 데이터 없음)")
-        return
+        return 0
     for out in parsed:
         print("  " + " | ".join(cell(v, w) for v, w in zip(out, widths)))
+    return len(parsed)
 
 
 def show(items, indent=2):
@@ -1171,11 +1180,16 @@ def main():
     ap.add_argument("--sql-file", help="SQL 파일 경로")
     ap.add_argument("--session", default="", help="sessionId")
     ap.add_argument("--sql-id", default="", help="sqlId (미지정 시 session 또는 HAR 값)")
-    ap.add_argument("--rows", type=int, default=200, help="가져올 행 수")
-    ap.add_argument("--start-row", type=int, default=0)
+    ap.add_argument("--rows", type=int, default=200,
+                    help="가져올 행 수 (서버측 상한도 이 값으로 맞춘다). 결과가 이 수를 "
+                         "정확히 채우면 뒤가 잘렸을 수 있다는 경고가 나온다")
+    ap.add_argument("--start-row", type=int, default=0,
+                    help="이 행부터 가져온다 (잘린 결과를 이어 받을 때)")
     ap.add_argument("--db-type", default="MySql")
     ap.add_argument("--use-limit", type=int, default=0)
-    ap.add_argument("--limit-count", type=int, default=0)
+    ap.add_argument("--limit-count", type=int, default=0,
+                    help="서버가 결과셋을 만들 때 자르는 행 수. 기본은 --rows 와 같으므로 "
+                         "따로 줄 일이 거의 없다 (--rows 보다 작게 주면 그 값이 상한이 된다)")
     ap.add_argument("--clear-first", action="store_true", help="execute 전에 clearExecute 호출")
     ap.add_argument("--get-connection", action="store_true", help="커넥션 메타만 조회")
     ap.add_argument("--dump", action="store_true", help="execute 응답 raw 구조도 출력")
@@ -1300,9 +1314,13 @@ def main():
         info("== clearExecute ==")
         sql_clear_execute(conn, db, sql_id, args.session, args.insecure, window_id)
 
+    # execute 의 limitCount 는 서버가 결과셋을 만들 때 자르는 값이라, getDataTable 에 아무리
+    # 큰 --rows 를 줘도 이 값을 넘지 못한다. 둘을 따로 두면 --rows 만 올린 조회가 조용히
+    # 잘리므로 기본값을 --rows 에 맞춘다 (--limit-count 를 직접 준 경우에는 그 값을 쓴다).
+    limit_count = args.limit_count or args.rows
     info("== execute ==")
     for d in sql_execute(conn, db, sql, parser_result,
-                         args.use_limit or 1, args.limit_count or 1000,
+                         args.use_limit or 1, limit_count,
                          args.insecure, window_id):
         if args.dump:
             show(decode_raw(d))
@@ -1310,10 +1328,15 @@ def main():
     info("== getDataTable ==")
     frames = sql_get_data_table(conn, db, sql_id, args.start_row, args.rows,
                                 args.session, args.insecure, window_id)
-    render_data_table(frames, args.max_col_width, args.tsv,
-                      expand=lambda rows: expand_lobs(rows, conn, db, args.lob_cells,
-                                                      args.lob_max_bytes, args.insecure,
-                                                      window_id))
+    shown = render_data_table(frames, args.max_col_width, args.tsv,
+                              expand=lambda rows: expand_lobs(rows, conn, db, args.lob_cells,
+                                                              args.lob_max_bytes, args.insecure,
+                                                              window_id))
+    # 상한을 정확히 채웠으면 그 뒤가 더 있는지 알 수 없다 — 서버는 잘렸다고 알려주지 않는다.
+    cap = min(args.rows, limit_count)
+    if shown and shown >= cap:
+        info(f"[주의] 상한 {cap}행을 정확히 채웠습니다 — 뒤가 잘렸을 수 있습니다. "
+             f"--rows 를 늘려 다시 조회하거나 --start-row 로 이어 받으세요.")
     if args.dump:
         for d in frames:
             show(decode_raw(d))
