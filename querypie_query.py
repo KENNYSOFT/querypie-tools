@@ -64,7 +64,10 @@ QueryPie 가 쿠키 인증이므로 브라우저 세션 쿠키를 재사용한�
   - `--rows` 하나만 주면 된다. 서버가 결과셋을 만들 때 자르는 값(execute 의 limitCount)도
     같은 값으로 맞추므로, 큰 수를 줘도 중간에서 잘리지 않는다.
   - 결과가 그 상한을 **정확히** 채우면 뒤가 더 있는지 알 수 없다 — 서버는 잘렸다고 알려주지
-    않으므로 도구가 경고를 남긴다. 그때는 `--rows` 를 늘리거나 `--start-row` 로 이어 받는다.
+    않으므로 도구가 경고를 남긴다. 그때는 `--rows` 를 늘려 다시 조회한다.
+  - 나눠 받을 때 `--start-row` 만 올리면 안 된다. 결과셋 자체가 상한에서 잘리므로
+    `--rows` 를 (시작행 + 받을 행) 이상으로 함께 키워야 한다 — `--start-row 1000 --rows 2000`.
+    상한을 벗어난 `--start-row` 는 언제나 0행이라 요청 전에 막는다.
 """
 import argparse
 import base64
@@ -1318,6 +1321,12 @@ def main():
     # 큰 --rows 를 줘도 이 값을 넘지 못한다. 둘을 따로 두면 --rows 만 올린 조회가 조용히
     # 잘리므로 기본값을 --rows 에 맞춘다 (--limit-count 를 직접 준 경우에는 그 값을 쓴다).
     limit_count = args.limit_count or args.rows
+    # 결과셋이 limitCount 행까지만 만들어지므로 그 너머를 가리키면 언제나 0행이다.
+    # 그대로 두면 "조용히 빈 결과" 가 되므로 요청을 보내기 전에 멈춘다.
+    if args.start_row >= limit_count:
+        ap.error(f"--start-row {args.start_row} 는 상한 {limit_count}행을 벗어나 결과가 늘 비어 있습니다.\n"
+                 f"  나눠 받으려면 상한을 (시작행 + 받을 행) 이상으로 주세요 — "
+                 f"예: --start-row {args.start_row} --rows {args.start_row + args.rows}")
     info("== execute ==")
     for d in sql_execute(conn, db, sql, parser_result,
                          args.use_limit or 1, limit_count,
@@ -1333,10 +1342,14 @@ def main():
                                                               args.lob_max_bytes, args.insecure,
                                                               window_id))
     # 상한을 정확히 채웠으면 그 뒤가 더 있는지 알 수 없다 — 서버는 잘렸다고 알려주지 않는다.
+    # 이어 받기는 --start-row 만으로는 안 된다: 결과셋 자체가 상한에서 잘리므로 상한도 함께
+    # 키워야 한다. 그 사실을 빼고 안내하면 그대로 따라 한 조회가 0행이 된다.
     cap = min(args.rows, limit_count)
     if shown and shown >= cap:
         info(f"[주의] 상한 {cap}행을 정확히 채웠습니다 — 뒤가 잘렸을 수 있습니다. "
-             f"--rows 를 늘려 다시 조회하거나 --start-row 로 이어 받으세요.")
+             f"--rows 를 늘려 다시 조회하세요. 나눠 받으려면 --start-row 와 함께 "
+             f"--rows 를 (시작행 + 받을 행) 이상으로 주어야 합니다 "
+             f"(예: --start-row {cap} --rows {cap * 2}).")
     if args.dump:
         for d in frames:
             show(decode_raw(d))
