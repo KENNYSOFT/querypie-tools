@@ -17,7 +17,7 @@ python -m pip install --target vendor sqlglot
 | `querypie_query.py` | SQL 조회. 결과를 표나 TSV 로 출력 |
 | `querypie_proxy.py` | 로컬 MySQL 프록시. HeidiSQL 같은 GUI 클라이언트를 QueryPie 에 붙인다 |
 | `querypie_conn.py` | 커넥션 목록 조회와 database 매핑 관리 |
-| `querypie_request.py` | SQL 실행 승인 요청 제출과 조회 |
+| `querypie_request.py` | SQL 실행 승인 요청 제출. 보낸 요청과 받은 요청(결재 대기)의 목록, 요청 한 건의 SQL과 사유, 결재 의견 조회 |
 | `querypie_import_har.py` | HAR 에서 세션 페이로드 추출 (커넥션 조립이 실패할 때의 대비책) |
 
 각 파일 맨 위 docstring 에 사용법이 있습니다.
