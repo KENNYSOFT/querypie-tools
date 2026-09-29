@@ -90,7 +90,12 @@ STEP_APPROVE_ANY = 1   # 누구든 한 명이 승인하면 통과
 # (UI 자체의 기본값은 확인하지 못했다), 단계에 여러 명을 넣을 때는 의도한 조건인지
 # --approve-condition 으로 명시하는 편이 안전하다.
 
-STATUS_LABEL = {1: "진행중", 2: "승인", 3: "반려", 4: "취소"}
+# 요청의 승인 상태 (proto.api.workflow.ApprovalStatus). 0 은 proto3 기본값이라 응답에서 빠져 온다.
+APPROVAL_STATUS = {0: "대기", 1: "진행중", 2: "승인", 3: "반려", 4: "취소", 5: "만료", 6: "임시저장"}
+# 요청 종류 (proto.api.workflow.RequestType). 목록 항목의 #2 가 이 값이다.
+REQUEST_TYPE = {0: "DB 접근", 1: "쿼리 실행", 2: "내보내기", 3: "서버 접근", 4: "접근 역할",
+                5: "마스킹 해제", 6: "서버 권한", 7: "웹앱 접근", 8: "복호화",
+                9: "제한 데이터 접근", 10: "DB 정책 예외", 11: "IP 등록", 12: "스키마 접근"}
 
 
 # --------------------------------------------------------------------------
@@ -267,6 +272,8 @@ def list_sent(method="GetInProgressPage", limit=50, insecure=False, window_id=""
     method 는 GetInProgressPage(진행 중) 또는 GetDonePage(완료)다. 완료 목록은 과거 요청의
     SQL 이나 실행 시간을 되짚을 때 쓴다. 목록에는 uuid 와 제목까지만 오므로 실행 시간 같은
     것은 uuid 로 상세 페이지를 열어 본다.
+
+    항목은 GetSentRequestPageResponse.Response 로, #2 가 요청 종류이고 승인 상태는 #4 다.
     """
     payload = qp.f_vi(9, limit)
     rows = []
@@ -277,7 +284,8 @@ def list_sent(method="GetInProgressPage", limit=50, insecure=False, window_id=""
             items = qp.decode_raw(raw)
             rows.append({
                 "uuid": qp.find_field(items, 1, "str") or "",
-                "status": qp.find_field(items, 2, "varint") or 0,
+                "type": qp.find_field(items, 2, "varint") or 0,
+                "status": qp.find_field(items, 4, "varint") or 0,
                 "title": qp.find_field(items, 3, "str") or "",
                 "created": qp.find_field(items, 6, "str") or "",
                 "number": qp.find_field(items, 9, "varint") or 0,
@@ -368,10 +376,9 @@ def main():
             print("  (완료된 요청 없음)" if done else "  (진행 중인 요청 없음)")
             return
         for r in rows:
-            # 완료 목록의 필드 2 는 진행 중 목록의 상태와 값이 달라(완료 건에도 1 이 온다)
-            # STATUS_LABEL 로 읽으면 "진행중" 으로 잘못 찍힌다. 의미를 확인하기 전까지 표시하지 않는다.
-            head = "" if done else f'[{STATUS_LABEL.get(r["status"], str(r["status"]))}] '
-            print(f'  #{r["number"]} {head}{to_kst(r["created"])}  {r["title"]}')
+            status = APPROVAL_STATUS.get(r["status"], str(r["status"]))
+            kind = REQUEST_TYPE.get(r["type"], str(r["type"]))
+            print(f'  #{r["number"]} [{status}] {kind}  {to_kst(r["created"])}  {r["title"]}')
             print(f'      {r["uuid"]}')
         return
 
