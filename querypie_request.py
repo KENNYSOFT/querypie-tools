@@ -7,6 +7,9 @@
 
 주의: submit 은 결재선에 지정한 사람들에게 실제 승인 요청을 보낸다(외부 영향).
       보내기 전에 `--dry-run` 으로 조립된 요청을 먼저 확인할 것.
+      approve 는 받은 요청을 실제로 승인한다(외부 영향). 승인하면 그 단계의 결재가 끝나
+      요청자가 곧바로 실행할 수 있고 되돌리는 수단이 없다. 먼저 `--dry-run` 으로 대상과
+      내 결재 차례인지, 사유의 GitHub 링크와 SQL 을 비교한 결과를 확인할 것.
       inbox 와 show 는 조회만 한다 (승인이나 반려는 하지 않는다).
 
 사용 예:
@@ -22,6 +25,10 @@
 
   # 요청 한 건의 SQL, 사유, 결재 의견 (보낸 요청과 받은 요청 모두)
   python querypie_request.py show <uuid>
+
+  # 받은 요청 승인 (먼저 --dry-run 으로 대상과 링크 비교 결과를 본다)
+  python querypie_request.py approve <uuid> [<uuid> ...] --dry-run
+  python querypie_request.py approve <uuid> [<uuid> ...] --comment "승인합니다."
 
   # 승인 요청 보내기 (결재자 3인 순차, 실행자 본인)
   python querypie_request.py submit \
@@ -48,12 +55,23 @@
 DB/커넥션:
   --db 는 querypie-conn-map.json 매핑으로 커넥션을 자동 선택한다(조회 도구와 동일).
   매핑에 없으면 --conn-name 또는 --conn <uuid> 로 지정한다.
+
+승인(approve):
+  요청마다 지금 내 결재 차례인지(결재 대기 목록에 있는지) 보고, 아니면 보내지 않고 건너뛴다.
+  사유에 GitHub 파일 링크가 있으면 그 파일과 요청 SQL 을 비교해 찍는다. 비공개 저장소를
+  읽어야 해 gh CLI 를 쓰고, gh 가 없으면 비교만 건너뛴다.
+  승인 뒤에는 상세를 다시 열어 이번 호출로 승인으로 바뀐 결재자와 그 의견을 확인한다.
+  의견을 주지 않으면 웹 UI 의 기본 의견과 같은 '승인합니다.' 가 들어간다.
 """
 import argparse
+import difflib
 import os
 import re
 import secrets
+import shutil
+import subprocess
 import sys
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -68,6 +86,10 @@ SVC_RULE = "api.user.workflow.rule.UserWorkflowRuleService"
 SVC_SENT = "api.workflow.SentRequestQueryService"
 SVC_RECEIVED = "api.workflow.ReceivedRequestQueryService"
 SVC_WORKFLOW = "api.workflow.WorkflowRequestQueryService"
+SVC_ACTION = "api.workflow.WorkflowRequestActionService"
+
+# 웹 UI 의 한국어 기본 승인 의견 (page.workflow.receivedRequest.todo.detail.msg.approval.defaultForApprove)
+DEFAULT_APPROVE_COMMENT = "승인합니다."
 
 # Submit 요청 필드 번호. 필드 이름은 QueryPie 웹 번들의 protobuf 정의에서 확인했다
 # (proto.api.workflow.sqlexecution.SubmitRequest / ...dataexport.SubmitRequest).
@@ -112,6 +134,7 @@ DETAIL_KIND = {1: "exec", 2: "export"}
 # 상세 조회 응답의 상태 이름. 모두 0 이 proto3 기본값이라 응답에서 빠져 온다.
 STEP_STATUS = {0: "-", 2: "진행중", 3: "승인", 4: "반려"}          # ApprovalStepStatus
 APPROVER_STATUS = {0: "-", 1: "대기", 2: "승인", 3: "반려"}        # ApprovalAssigneeStatus
+APPROVER_APPROVED = 2
 EXECUTOR_STATUS = {0: "-", 1: "대기", 2: "실행함", 3: "취소"}      # ExecutionAssigneeStatus
 REVIEWER_STATUS = {0: "-", 1: "안 읽음", 2: "확인"}                # ReviewAssigneeStatus
 EXECUTION_STATUS = {0: "-", 1: "대기", 2: "실행 중", 3: "성공", 4: "실패", 5: "취소", 6: "만료"}
@@ -540,6 +563,181 @@ def print_detail(uuid, kind, d):
 
 
 # --------------------------------------------------------------------------
+# 받은 요청 승인
+# --------------------------------------------------------------------------
+# 사유에 적힌 GitHub 파일 링크. ref 에 / 가 든 브랜치는 첫 조각만 ref 로 읽혀 파일을 받지 못한다.
+GITHUB_BLOB_RE = re.compile(r"https://github\.com/([\w.-]+)/([\w.-]+)/blob/([^/\s]+)/([^\s#?)>\]]+)")
+# 링크와 SQL 이 다를 때 찍을 차이 줄 수
+DIFF_LINES = 20
+
+
+def fetch_github_file(owner, repo, ref, path):
+    """저장소 파일 원문을 gh CLI 로 받는다. (bytes, None) 또는 (None, 받지 못한 사유).
+
+    비공개 저장소도 읽어야 해 gh 의 인증을 빌린다. gh 가 없으면 비교만 건너뛴다.
+    """
+    gh = shutil.which("gh")
+    if not gh:
+        return None, "gh 가 없어 비교하지 않았습니다"
+    api = (f"repos/{owner}/{repo}/contents/{urllib.parse.quote(path)}"
+           f"?ref={urllib.parse.quote(ref, safe='')}")
+    try:
+        r = subprocess.run([gh, "api", "-H", "Accept: application/vnd.github.raw", api],
+                           capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return None, "파일을 받지 못했습니다 (60초 안에 응답이 없음)"
+    if r.returncode != 0:
+        err = r.stderr.decode("utf-8", "replace").strip().splitlines()
+        why = err[-1] if err else f"gh 종료 코드 {r.returncode}"
+        return None, f"파일을 받지 못했습니다 ({why})"
+    return r.stdout, None
+
+
+def normalize_eol(text):
+    """줄 끝을 LF 로 맞추고 파일 끝 개행을 걷어낸다. 붙여 넣으며 생기는 차이만 지운다."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+
+
+def compare_links(reason, content):
+    """사유의 GitHub 파일 링크마다 요청 SQL 과 비교한다. [(링크, 판정, 차이 줄)].
+
+    판정은 '같음', '같음 (줄 끝이나 파일 끝 개행만 다름)', '다름', 또는 받지 못한 사유다.
+    """
+    out = []
+    for m in GITHUB_BLOB_RE.finditer(reason or ""):
+        owner, repo, ref, raw_path = m.groups()
+        path = urllib.parse.unquote(raw_path.rstrip(".,;:"))
+        data, err = fetch_github_file(owner, repo, ref, path)
+        if data is None:
+            out.append((m.group(0), err, []))
+            continue
+        text = data.decode("utf-8-sig", "replace")
+        if text == content:
+            out.append((m.group(0), "같음", []))
+        elif normalize_eol(text) == normalize_eol(content):
+            out.append((m.group(0), "같음 (줄 끝이나 파일 끝 개행만 다름)", []))
+        else:
+            diff = list(difflib.unified_diff(normalize_eol(text).split("\n"),
+                                             normalize_eol(content).split("\n"),
+                                             "링크 파일", "요청 SQL", lineterm="", n=1))
+            more = [f"... ({len(diff) - DIFF_LINES}줄 더)"] if len(diff) > DIFF_LINES else []
+            out.append((m.group(0), "다름", diff[:DIFF_LINES] + more))
+    return out
+
+
+def link_verdict(results):
+    """요청 한 건의 링크 비교 결과를 집계용 낱말 하나로 줄인다."""
+    if not results:
+        return "링크 없음"
+    verdicts = [v for _, v, _ in results]
+    if "다름" in verdicts:
+        return "다름"
+    if all(v.startswith("같음") for v in verdicts):
+        return "같음"
+    return "비교 못 함"
+
+
+def todo_requests(insecure=False, window_id=""):
+    """지금 내 결재 차례인 요청을 {uuid: 목록 항목} 으로 모은다. 쪽을 넘기며 전부 받는다."""
+    rows = {}
+    for page in range(100):
+        batch, total = list_received("GetToDoPage", 50, page, insecure, window_id)
+        rows.update((r["uuid"], r) for r in batch)
+        if not batch or len(rows) >= total:
+            break
+    return rows
+
+
+def approver_states(d):
+    """상세 응답의 결재자마다 (단계 번호, 사람) 을 (상태, 의견) 에 대응시킨다."""
+    out = {}
+    for i, step in enumerate(pb_msgs(d, 11), 1):
+        for p in pb_msgs(step, 2):
+            out[(i, who(pb_msg(p, 1)))] = (pb_int(p, 2), pb_str(p, 5))
+    return out
+
+
+def approve(uuid, comments, insecure=False, window_id=""):
+    """WorkflowRequestActionService/Approve 로 요청 한 건을 승인한다 (외부 영향).
+
+    ApproveRequest 는 #1 uuid, #2 의견, #3 accessControl 이다. 웹 UI 는 쿼리 실행과 내보내기
+    요청에 #1, #2 만 보내고, #3(승인할 클러스터 목록)은 DB 접근 제어 요청에서만 채운다.
+    응답은 빈 메시지라 결과는 상세를 다시 열어 확인한다.
+    """
+    qp.call(SVC_ACTION, "Approve", qp.f_str(1, uuid) + qp.f_str(2, comments), insecure,
+            window_id=window_id)
+
+
+def approve_requests(uuids, comments, dry_run=False, insecure=False, window_id=""):
+    """요청마다 내 결재 차례인지와 링크 비교 결과를 찍고, dry_run 이 아니면 승인한 뒤 확인한다.
+
+    내 차례가 아니거나 쿼리 실행, 내보내기 요청이 아니면 보내지 않고 건너뛴다. 로그인한
+    사람을 알려 주는 API 가 없어, 승인 뒤에는 이번 호출로 '대기' 에서 '승인' 으로 바뀐
+    결재자로 나를 찾는다. 그런 사람이 정확히 한 명이고 의견이 보낸 문구와 같아야 하며,
+    아니면 그 자리에서 멈춘다. 승인 호출 자체가 실패하면 qp.call 이 멈춘다.
+    """
+    todo = todo_requests(insecure, window_id)
+    approved, skipped, verdicts = 0, 0, {}
+    for uuid in dict.fromkeys(uuids):
+        row = todo.get(uuid)
+        rtype = request_type(uuid, insecure, window_id)
+        kind = DETAIL_KIND.get(rtype)
+        print()
+        if not kind:
+            print(f"  [건너뜀] {uuid}: '{REQUEST_TYPE.get(rtype, rtype)}' 요청은 승인하지 않습니다 "
+                  "(쿼리 실행과 내보내기만)")
+            skipped += 1
+            continue
+        d = get_detail(uuid, kind, insecure, window_id)
+        content = pb_str(d, 7)
+        conn = pb_msg(d, 5)
+        cluster = pb_str(conn, 2)
+        number = f"#{row['number']} " if row else ""
+        print(f"  {number}{pb_str(d, 2)}")
+        print(f"      uuid    : {uuid}")
+        print(f"      요청자  : {who(pb_msg(d, 18))}  ({to_kst(pb_str(d, 17))})")
+        print(f"      대상 DB : {pb_str(conn, 10)}" + (f"  ({cluster})" if cluster else ""))
+        print(f"      SQL     : {len(content)}자")
+        results = compare_links(pb_str(d, 10), content)
+        if not results:
+            print("      링크    : (사유에 GitHub 파일 링크가 없음)")
+        for url, verdict, diff in results:
+            print(f"      링크    : {url}")
+            print(f"                {verdict}")
+            for line in diff:
+                print(f"                | {line}")
+        if not row:
+            status = pb_int(d, 12)
+            print(f"      결재    : [건너뜀] 내 결재 대기 목록에 없습니다 "
+                  f"(요청 상태 {APPROVAL_STATUS.get(status, str(status))})")
+            skipped += 1
+            continue
+        verdict = link_verdict(results)
+        verdicts[verdict] = verdicts.get(verdict, 0) + 1
+        if dry_run:
+            print("      결재    : 내 결재 차례 (승인 대상)")
+            continue
+        before = approver_states(d)
+        approve(uuid, comments, insecure, window_id)
+        after = approver_states(get_detail(uuid, kind, insecure, window_id))
+        changed = [k for k, (st, _) in after.items()
+                   if st == APPROVER_APPROVED and before.get(k, (0, ""))[0] != APPROVER_APPROVED]
+        if len(changed) != 1 or after[changed[0]][1].strip() != comments.strip():
+            sys.exit(f"      [확인 실패] 승인은 보냈지만 이번에 승인으로 바뀐 결재자를 한 명으로 "
+                     f"확인하지 못했습니다 ({len(changed)}명). `show {uuid}` 로 확인하세요.")
+        print(f"      결재    : 승인함  {changed[0][1]}  의견: {after[changed[0]][1]}")
+        approved += 1
+
+    print()
+    counts = ", ".join(f"{k} {v}건" for k, v in verdicts.items()) or "-"
+    if dry_run:
+        print(f"  [dry-run] 보내지 않았습니다. 승인 대상 {sum(verdicts.values())}건 "
+              f"(링크 비교: {counts}), 건너뜀 {skipped}건")
+    else:
+        print(f"  승인 {approved}건 (링크 비교: {counts}), 건너뜀 {skipped}건")
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 def add_common(ap):
@@ -606,6 +804,14 @@ def main():
     add_common(p_show)
     p_show.add_argument("uuid", help="요청 uuid (목록에서 각 요청 아래 줄에 찍힌 값)")
 
+    p_ap = sub.add_parser("approve", help="받은 요청 승인 (먼저 --dry-run 으로 대상과 링크 비교를 확인)")
+    add_common(p_ap)
+    p_ap.add_argument("uuid", nargs="+", help="승인할 요청 uuid (inbox 에서 각 요청 아래 줄에 찍힌 값)")
+    p_ap.add_argument("--comment", default=DEFAULT_APPROVE_COMMENT,
+                      help=f"결재 의견 (기본: 웹 UI 의 기본 의견과 같은 '{DEFAULT_APPROVE_COMMENT}')")
+    p_ap.add_argument("--dry-run", action="store_true",
+                      help="보내지 않고 대상, 내 결재 차례인지, 링크 비교 결과만 출력")
+
     p_as = sub.add_parser("assignees", help="결재선에 넣을 수 있는 사람/그룹 목록")
     add_common(p_as)
 
@@ -666,6 +872,12 @@ def main():
             sys.exit(f"'{REQUEST_TYPE.get(rtype, rtype)}' 요청은 상세를 풀지 못합니다 "
                      "(쿼리 실행과 내보내기만 됩니다).")
         print_detail(args.uuid, kind, get_detail(args.uuid, kind, args.insecure, window_id))
+        return
+
+    if args.cmd == "approve":
+        if not args.comment.strip():
+            ap.error("--comment 가 비어 있습니다")
+        approve_requests(args.uuid, args.comment, args.dry_run, args.insecure, window_id)
         return
 
     rule_uuid, rule_name = resolve_rule(args.rule, args.insecure, window_id)

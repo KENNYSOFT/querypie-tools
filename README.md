@@ -8,6 +8,8 @@ QueryPie 웹 UI 가 쓰는 gRPC-Web 인터페이스를 그대로 호출하는 CL
 python -m pip install --target vendor sqlglot
 ```
 
+받은 요청을 승인할 때 사유의 GitHub 링크와 SQL 을 비교하는 기능은 `gh` CLI 로 파일을 받습니다. `gh` 가 없으면 그 비교만 건너뜁니다.
+
 할 수 있는 일은 계정 권한 안에서만입니다. 쿼리는 QueryPie 를 그대로 거치므로 접근 제어와 감사 로그는 서버 정책을 따릅니다.
 
 ## 도구
@@ -17,7 +19,7 @@ python -m pip install --target vendor sqlglot
 | `querypie_query.py` | SQL 조회. 결과를 표나 TSV 로 출력 |
 | `querypie_proxy.py` | 로컬 MySQL 프록시. HeidiSQL 같은 GUI 클라이언트를 QueryPie 에 붙인다 |
 | `querypie_conn.py` | 커넥션 목록 조회와 database 매핑 관리 |
-| `querypie_request.py` | SQL 실행 승인 요청 제출. 보낸 요청과 받은 요청(결재 대기)의 목록, 요청 한 건의 SQL과 사유, 결재 의견 조회 |
+| `querypie_request.py` | SQL 실행 승인 요청 제출. 보낸 요청과 받은 요청(결재 대기)의 목록, 요청 한 건의 SQL과 사유, 결재 의견 조회. 받은 요청 승인 |
 | `querypie_import_har.py` | HAR 에서 세션 페이로드 추출 (커넥션 조립이 실패할 때의 대비책) |
 
 각 파일 맨 위 docstring 에 사용법이 있습니다.
